@@ -1,0 +1,9 @@
+{
+  "requestId": 4,
+  "ok": true,
+  "tabUrl": "https://www.linkedin.com/feed/",
+  "data": {
+    "url": "https://www.linkedin.com/feed/",
+    "title": "Feed | LinkedIn"
+  }
+}

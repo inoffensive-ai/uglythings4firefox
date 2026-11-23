@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Bridge",
+  "version": "1.0",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "scripting",
+    "nativeMessaging",
+    "webRequest",
+    "webRequestBlocking",
+    "webRequestFilterResponse",
+    "webRequestFilterResponse.serviceWorkerScript",
+    "webRequestAuthProvider",
+    "cookies",
+    "storage",
+    "unlimitedStorage",
+    "browsingData",
+    "history",
+    "bookmarks",
+    "webNavigation",
+    "tabHide",
+    "declarativeNetRequest",
+    "declarativeNetRequestFeedback",
+    "downloads",
+    "downloads.open",
+    "clipboardRead",
+    "clipboardWrite",
+    "notifications",
+    "proxy",
+    "management",
+    "contextualIdentities",
+    "sessions",
+    "topSites",
+    "alarms",
+    "menus",
+    "search",
+    "find",
+    "browserSettings",
+    "privacy",
+    "dns",
+    "geolocation"
+  ],
+  "optional_permissions": [
+    "userScripts"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "bridge@example.com"
+    }
+  },
+  "background": {
+    "scripts": [
+      "bg.js"
+    ]
+  }
+}
