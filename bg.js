@@ -1,4 +1,5 @@
 let port = null;
+let reconnectTimer = null;
 const networkLog = new Map();
 const MAX_NETWORK_ENTRIES = 200;
 const navLog = [];
@@ -47,7 +48,10 @@ browser.webRequest.onBeforeRequest.addListener(
     };
     recordEntry(details.requestId, entry);
 
-    if (typeof browser.webRequest.filterResponseData === "function") {
+    if (
+      typeof browser.webRequest.filterResponseData === "function" &&
+      /^https?:/i.test(details.url)
+    ) {
       try {
         const filter = browser.webRequest.filterResponseData(details.requestId);
         const chunks = [];
@@ -72,11 +76,15 @@ browser.webRequest.onBeforeRequest.addListener(
             rawText: new TextDecoder("utf-8", { fatal: false }).decode(merged),
             rawBytes: totalLen
           });
-          filter.close();
+          if (filter.status === "transferringdata") {
+            filter.close();
+          }
         };
         filter.onerror = () => {
           recordEntry(details.requestId, { filterError: filter.error || "filter error" });
-          try { filter.close(); } catch (_) {}
+          if (filter.status === "transferringdata" || filter.status === "open") {
+            try { filter.close(); } catch (_) {}
+          }
         };
       } catch (_) {}
     }
@@ -97,20 +105,37 @@ browser.webRequest.onHeadersReceived.addListener(
   ["responseHeaders"]
 );
 
+function scheduleReconnect(delayMs = 1000) {
+  if (reconnectTimer !== null) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectPort();
+  }, delayMs);
+}
+
 function connectPort() {
   if (port) return port;
   const p = browser.runtime.connectNative("browser_bridge");
   p.onMessage.addListener(async (msg) => {
     if (!msg || typeof msg !== "object") return;
     if (msg.requestId !== undefined) {
-      const result = await handleCommand(msg);
-      p.postMessage({ requestId: msg.requestId, ...result });
+      try {
+        const result = await handleCommand(msg);
+        p.postMessage({ requestId: msg.requestId, ...result });
+      } catch (err) {
+        p.postMessage({
+          requestId: msg.requestId,
+          ok: false,
+          error: err && err.message ? err.message : String(err)
+        });
+      }
     }
   });
   p.onDisconnect.addListener((disconnectedPort) => {
     const err = disconnectedPort.error ? disconnectedPort.error.message : "disconnected";
     console.warn("Native port disconnected:", err);
     port = null;
+    scheduleReconnect(1000);
   });
   port = p;
   return port;
@@ -121,7 +146,6 @@ async function handleCommand(msg) {
   const params = msg.params || [];
 
   try {
-    // Tabs & Navigation
     if (method === "getTabs") {
       const tabs = await browser.tabs.query({});
       return { ok: true, data: tabs.map(t => ({ id: t.id, url: t.url, title: t.title, hidden: t.hidden })) };
@@ -146,7 +170,6 @@ async function handleCommand(msg) {
       return { ok: true, tabId };
     }
 
-    // DOM, Eval & Collection
     if (method === "getDom") {
       const tab = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
       const res = await browser.scripting.executeScript({
@@ -237,7 +260,6 @@ async function handleCommand(msg) {
       };
     }
 
-    // Cookies & Storage
     if (method === "getCookies") {
       const details = msg.details || (msg.url ? { url: msg.url } : {});
       return { ok: true, data: await browser.cookies.getAll(details) };
@@ -259,7 +281,6 @@ async function handleCommand(msg) {
       return { ok: true };
     }
 
-    // BrowsingData, History & Bookmarks
     if (method === "clearBrowsingData") {
       const options = msg.options || {};
       const dataToRemove = msg.dataToRemove || { cache: true, cookies: true };
@@ -279,12 +300,11 @@ async function handleCommand(msg) {
       return { ok: true, data: await browser.bookmarks.create({ title: msg.title || msg.url, url: msg.url, parentId: msg.parentId }) };
     }
 
-    // WebNavigation, UserScripts & DeclarativeNetRequest
     if (method === "getNavLog") {
       return { ok: true, data: navLog.slice(-Number(msg.limit || 100)) };
     }
 
-   if (method === "registerUserScript") {
+    if (method === "registerUserScript") {
       if (!browser.userScripts) {
         const granted = await browser.permissions.request({ permissions: ["userScripts"] });
         if (!granted) {
@@ -312,7 +332,6 @@ async function handleCommand(msg) {
       return { ok: true };
     }
 
-    // Downloads, Clipboard, Notifications, Proxy & Management
     if (method === "download") {
       const id = await browser.downloads.download({
         url: msg.url || params[0],
