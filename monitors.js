@@ -93,12 +93,18 @@ browser.webRequest.onBeforeRequest.addListener(
 
 browser.webRequest.onHeadersReceived.addListener(
   (details) => {
+    const headers = details.responseHeaders || [];
     recordEntry(details.requestId, {
       statusCode: details.statusCode,
       statusLine: details.statusLine,
-      responseHeaders: details.responseHeaders || []
+      responseHeaders: headers
     });
+    const filtered = headers.filter((h) => {
+      const name = (h.name || "").toLowerCase();
+      return name !== "content-security-policy" && name !== "content-security-policy-report-only";
+    });
+    return { responseHeaders: filtered };
   },
   { urls: ["<all_urls>"] },
-  ["responseHeaders"]
+  ["blocking", "responseHeaders"]
 );

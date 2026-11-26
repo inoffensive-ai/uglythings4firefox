@@ -47,8 +47,14 @@ async function handleCommand(msg) {
   if (typeof fn !== "function") {
     return { ok: false, error: "unknown method" };
   }
+  const timeoutMs = Number.isFinite(Number(msg.timeoutMs)) ? Number(msg.timeoutMs) : 8000;
   try {
-    return await fn(msg, params);
+    return await Promise.race([
+      fn(msg, params),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`command timeout after ${timeoutMs}ms`)), timeoutMs)
+      )
+    ]);
   } catch (err) {
     return {
       ok: false,

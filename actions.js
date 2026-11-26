@@ -58,6 +58,7 @@ const ACTION_HANDLERS = {
     if (!tab) return { ok: false, error: "no target tab found" };
     const res = await browser.scripting.executeScript({
       target: { tabId: tab.id },
+      injectImmediately: true,
       func: () => ({
         url: location.href,
         title: document.title || "",
@@ -77,6 +78,7 @@ const ACTION_HANDLERS = {
     if (!tab) return { ok: false, error: "no target tab found" };
     const res = await browser.scripting.executeScript({
       target: { tabId: tab.id },
+      injectImmediately: true,
       args: [code],
       func: (snippet) => {
         const serializeInPage = (val, depth = 0, seen = new WeakSet()) => {
@@ -144,7 +146,7 @@ const ACTION_HANDLERS = {
           return String(val);
         };
 
-        return serializeInPage((0, eval)(snippet));
+        return serializeInPage(new Function(snippet)());
       }
     });
     const first = res && res[0] ? res[0] : null;
@@ -159,6 +161,7 @@ const ACTION_HANDLERS = {
     if (!tab) return { ok: false, error: "no target tab found" };
     const res = await browser.scripting.executeScript({
       target: { tabId: tab.id },
+      injectImmediately: true,
       func: () => {
         const html = document.documentElement ? document.documentElement.outerHTML : "";
         return {
@@ -186,6 +189,7 @@ const ACTION_HANDLERS = {
 
     const res = await browser.scripting.executeScript({
       target: { tabId: tab.id },
+      injectImmediately: true,
       args: [selector, all, attr, includeHtml, includeAssets],
       func: (sel, isAll, attribute, wantHtml, wantAssets) => {
         const serializeEl = (el) => {
@@ -277,6 +281,76 @@ const ACTION_HANDLERS = {
     return safeSerialize(response);
   },
 
+  async press(msg, params) {
+    const selector = msg.selector ?? params[0] ?? null;
+    const matchText = typeof msg.text === "string" ? msg.text.trim().toLowerCase() : null;
+    const index = Number.isFinite(Number(msg.index)) ? Number(msg.index) : 0;
+    const key = typeof msg.key === "string" && msg.key.trim() ? msg.key.trim() : "Enter";
+    const tab = await getTargetTab(msg);
+    if (!tab) return { ok: false, error: "no target tab found" };
+
+    const res = await browser.scripting.executeScript({
+      target: { tabId: tab.id },
+      injectImmediately: true,
+      args: [selector, matchText, index, key],
+      func: (sel, wantedText, idx, keyName) => {
+        let target = document.activeElement;
+        let matchedCount = 0;
+
+        if (sel) {
+          const candidates = Array.from(document.querySelectorAll(sel)).filter((el) => {
+            if (!wantedText) return true;
+            const txt = (el.innerText || el.textContent || "").trim().toLowerCase();
+            const aria = (el.getAttribute("aria-label") || "").trim().toLowerCase();
+            return txt.includes(wantedText) || aria.includes(wantedText);
+          });
+          matchedCount = candidates.length;
+          target = candidates[idx] || null;
+        }
+
+        if (!target) {
+          return { pressed: false, matchedCount, key: keyName, url: location.href };
+        }
+
+        if (typeof target.scrollIntoView === "function") {
+          target.scrollIntoView({ block: "center", inline: "nearest" });
+        }
+        if (typeof target.focus === "function") {
+          target.focus({ preventScroll: true });
+        }
+
+        const keyCode = keyName === "Enter" ? 13 : keyName === "Space" || keyName === " " ? 32 : keyName === "Escape" ? 27 : 0;
+        const code = keyName === " " ? "Space" : keyName;
+
+        for (const evType of ["pointerdown", "mousedown"]) {
+          target.dispatchEvent(new MouseEvent(evType, { bubbles: true, cancelable: true, view: window }));
+        }
+        target.dispatchEvent(new KeyboardEvent("keydown", { key: keyName, code, keyCode, which: keyCode, bubbles: true, cancelable: true }));
+        target.dispatchEvent(new KeyboardEvent("keypress", { key: keyName, code, keyCode, which: keyCode, bubbles: true, cancelable: true }));
+        for (const evType of ["pointerup", "mouseup", "click"]) {
+          target.dispatchEvent(new MouseEvent(evType, { bubbles: true, cancelable: true, view: window }));
+        }
+        target.dispatchEvent(new KeyboardEvent("keyup", { key: keyName, code, keyCode, which: keyCode, bubbles: true, cancelable: true }));
+
+        return {
+          pressed: true,
+          matchedCount,
+          key: keyName,
+          tag: target.tagName.toLowerCase(),
+          text: (target.innerText || target.textContent || "").trim().slice(0, 120),
+          href: target.href || target.getAttribute("href") || null,
+          url: location.href
+        };
+      }
+    });
+
+    const first = res && res[0] ? res[0] : null;
+    if (first && first.error) {
+      return { ok: false, tabUrl: tab.url || null, error: String(first.error) };
+    }
+    return { ok: true, tabUrl: tab.url || null, data: safeSerialize(first ? first.result : null) };
+  },
+
   async click(msg, params) {
     const selector = msg.selector ?? params[0];
     const matchText = typeof msg.text === "string" ? msg.text.trim().toLowerCase() : null;
@@ -289,6 +363,7 @@ const ACTION_HANDLERS = {
 
     const res = await browser.scripting.executeScript({
       target: { tabId: tab.id },
+      injectImmediately: true,
       args: [selector, matchText, index],
       func: (sel, wantedText, idx) => {
         const candidates = Array.from(document.querySelectorAll(sel)).filter((el) => {
