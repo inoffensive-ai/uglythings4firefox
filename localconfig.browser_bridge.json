@@ -1,0 +1,9 @@
+{
+  "name": "browser_bridge",
+  "description": "Native messaging host for Browser Bridge",
+  "path": "/home/wheel1/UglyThingForFirefox/bridge_host.py",
+  "type": "stdio",
+  "allowed_extensions": [
+    "uglythingsforfirefox@proton.me"
+  ]
+}

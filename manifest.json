@@ -49,7 +49,7 @@
   ],
   "browser_specific_settings": {
     "gecko": {
-      "id": "bridge@example.com"
+      "id": "uglythingsforfirefox@proton.me"
     }
   },
   "background": {
