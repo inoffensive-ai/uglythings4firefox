@@ -25,6 +25,111 @@ function recordNav(eventName, details) {
   }
 }
 
+function safeSerialize(val, depth = 0, seen = new WeakSet()) {
+  if (val === null || val === undefined) return null;
+  const t = typeof val;
+  if (t === "boolean") return val;
+  if (t === "number") return Number.isFinite(val) ? val : null;
+  if (t === "string") return val.length > 250000 ? val.slice(0, 250000) : val;
+  if (t === "bigint") return val.toString();
+  if (t === "function") return `[Function: ${val.name || "anonymous"}]`;
+  if (t === "symbol") return String(val);
+  if (depth >= 8) return "[MaxDepth]";
+
+  if (t === "object") {
+    if (seen.has(val)) return "[Circular]";
+    seen.add(val);
+
+    if (Array.isArray(val)) {
+      return val.slice(0, 500).map((item) => safeSerialize(item, depth + 1, seen));
+    }
+    if (val instanceof Set) {
+      return Array.from(val).slice(0, 500).map((item) => safeSerialize(item, depth + 1, seen));
+    }
+    if (val instanceof Map) {
+      const obj = {};
+      let i = 0;
+      for (const [k, v] of val.entries()) {
+        if (i++ >= 200) break;
+        obj[String(k)] = safeSerialize(v, depth + 1, seen);
+      }
+      return obj;
+    }
+    if (val instanceof RegExp || val instanceof Date || val instanceof URL) {
+      return String(val);
+    }
+    if (val instanceof Error) {
+      return { name: val.name, message: val.message, stack: val.stack || null };
+    }
+    if (typeof Element !== "undefined" && val instanceof Element) {
+      const tag = val.tagName.toLowerCase();
+      const out = {
+        tag,
+        id: val.id || null,
+        className: typeof val.className === "string" ? val.className : null,
+        text: (val.innerText ?? val.textContent ?? "").trim().slice(0, 1000)
+      };
+      if (tag === "a" || val.hasAttribute("href")) {
+        out.href = val.href || val.getAttribute("href") || null;
+      }
+      if (tag === "img" || tag === "script" || tag === "iframe" || val.hasAttribute("src")) {
+        out.src = val.src || val.getAttribute("src") || null;
+      }
+      return out;
+    }
+
+    const out = {};
+    let count = 0;
+    for (const k of Object.keys(val)) {
+      if (count++ >= 250) break;
+      try {
+        out[String(k)] = safeSerialize(val[k], depth + 1, seen);
+      } catch (err) {
+        out[String(k)] = `[Unserializable: ${err && err.message ? err.message : String(err)}]`;
+      }
+    }
+    return out;
+  }
+
+  return String(val);
+}
+
+function sanitizeNativePayload(obj) {
+  const serialized = safeSerialize(obj);
+  if (serialized && typeof serialized === "object" && !Array.isArray(serialized)) {
+    return serialized;
+  }
+  return { ok: false, error: "Invalid native response payload" };
+}
+
+function postNativeMessage(targetPort, payload) {
+  if (!targetPort) return;
+  try {
+    targetPort.postMessage(sanitizeNativePayload(payload));
+  } catch (err) {
+    try {
+      targetPort.postMessage({
+        requestId: payload && payload.requestId,
+        ok: false,
+        error: `Native postMessage serialization error: ${err && err.message ? err.message : String(err)}`
+      });
+    } catch (_) {}
+  }
+}
+
+async function getTargetTab(msg) {
+  const explicitTabId = msg.tabId ?? msg.targetTabId;
+  if (explicitTabId !== undefined && explicitTabId !== null && explicitTabId !== "") {
+    return await browser.tabs.get(Number(explicitTabId));
+  }
+  const activeTabs = await browser.tabs.query({ active: true, currentWindow: true });
+  if (activeTabs && activeTabs[0]) return activeTabs[0];
+  const anyActive = await browser.tabs.query({ active: true });
+  if (anyActive && anyActive[0]) return anyActive[0];
+  const allTabs = await browser.tabs.query({});
+  return allTabs[0] || null;
+}
+
 if (browser.webNavigation) {
   browser.webNavigation.onCommitted.addListener((d) => recordNav("onCommitted", d));
   browser.webNavigation.onDOMContentLoaded.addListener((d) => recordNav("onDOMContentLoaded", d));
@@ -121,9 +226,9 @@ function connectPort() {
     if (msg.requestId !== undefined) {
       try {
         const result = await handleCommand(msg);
-        p.postMessage({ requestId: msg.requestId, ...result });
+        postNativeMessage(p, { requestId: msg.requestId, ...result });
       } catch (err) {
-        p.postMessage({
+        postNativeMessage(p, {
           requestId: msg.requestId,
           ok: false,
           error: err && err.message ? err.message : String(err)
@@ -143,136 +248,285 @@ function connectPort() {
 
 async function handleCommand(msg) {
   const method = msg.method || msg.type;
-  const params = msg.params || [];
+  const params = Array.isArray(msg.params) ? msg.params : [];
 
   try {
     if (method === "getTabs") {
       const tabs = await browser.tabs.query({});
-      return { ok: true, data: tabs.map(t => ({ id: t.id, url: t.url, title: t.title, hidden: t.hidden })) };
+      return {
+        ok: true,
+        data: safeSerialize(tabs.map((t) => ({
+          id: t.id,
+          url: t.url,
+          title: t.title,
+          hidden: t.hidden,
+          active: t.active
+        })))
+      };
     }
 
     if (method === "navigate") {
-      const url = params[0] || msg.url;
-      const tab = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+      const url = msg.url ?? params[0];
+      if (!url || typeof url !== "string") {
+        return { ok: false, error: "navigate requires a valid url" };
+      }
+      const tab = await getTargetTab(msg);
+      if (!tab) return { ok: false, error: "no target tab found" };
       await browser.tabs.update(tab.id, { url });
-      return { ok: true, url };
+      return { ok: true, tabId: tab.id, url };
     }
 
     if (method === "hideTab") {
-      const tabId = Number(msg.tabId ?? params[0] ?? (await browser.tabs.query({ active: true, currentWindow: true }))[0].id);
+      const tab = await getTargetTab(msg);
+      const tabId = Number(msg.tabId ?? params[0] ?? (tab ? tab.id : undefined));
+      if (!Number.isFinite(tabId)) return { ok: false, error: "invalid tabId" };
       await browser.tabs.hide(tabId);
       return { ok: true, tabId };
     }
 
     if (method === "showTab") {
-      const tabId = Number(msg.tabId ?? params[0]);
+      const tab = await getTargetTab(msg);
+      const tabId = Number(msg.tabId ?? params[0] ?? (tab ? tab.id : undefined));
+      if (!Number.isFinite(tabId)) return { ok: false, error: "invalid tabId" };
       await browser.tabs.show(tabId);
       return { ok: true, tabId };
     }
 
     if (method === "getDom") {
-      const tab = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
-      const res = await browser.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: () => ({ url: location.href, title: document.title })
-      });
-      return { ok: true, tabUrl: tab ? tab.url : null, data: res && res[0] ? (res[0].result ?? null) : null };
-    }
-
-    if (method === "eval") {
-      const code = msg.code || params[0];
-      const tab = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
-      const res = await browser.scripting.executeScript({
-        target: { tabId: tab.id },
-        args: [code],
-        func: (snippet) => (0, eval)(snippet)
-      });
-      return { ok: true, tabUrl: tab ? tab.url : null, data: res && res[0] ? (res[0].result ?? null) : null };
-    }
-
-    if (method === "getHtml") {
-      const tab = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+      const tab = await getTargetTab(msg);
+      if (!tab) return { ok: false, error: "no target tab found" };
       const res = await browser.scripting.executeScript({
         target: { tabId: tab.id },
         func: () => ({
           url: location.href,
-          title: document.title,
-          length: document.documentElement.outerHTML.length,
-          html: document.documentElement.outerHTML
+          title: document.title || "",
+          readyState: document.readyState
         })
       });
-      return { ok: true, tabUrl: tab ? tab.url : null, data: res && res[0] ? (res[0].result ?? null) : null };
+      const raw = res && res[0] ? res[0].result : null;
+      return { ok: true, tabUrl: tab.url || null, data: safeSerialize(raw) };
+    }
+
+    if (method === "eval") {
+      const code = msg.code ?? params[0];
+      if (typeof code !== "string" || !code.trim()) {
+        return { ok: false, error: "eval requires non-empty code string" };
+      }
+      const tab = await getTargetTab(msg);
+      if (!tab) return { ok: false, error: "no target tab found" };
+      const res = await browser.scripting.executeScript({
+        target: { tabId: tab.id },
+        args: [code],
+        func: (snippet) => {
+          const serializeInPage = (val, depth = 0, seen = new WeakSet()) => {
+            if (val === null || val === undefined) return null;
+            const t = typeof val;
+            if (t === "boolean") return val;
+            if (t === "number") return Number.isFinite(val) ? val : null;
+            if (t === "string") return val.length > 250000 ? val.slice(0, 250000) : val;
+            if (t === "bigint") return val.toString();
+            if (t === "function") return `[Function: ${val.name || "anonymous"}]`;
+            if (t === "symbol") return String(val);
+            if (depth >= 8) return "[MaxDepth]";
+            if (t === "object") {
+              if (seen.has(val)) return "[Circular]";
+              seen.add(val);
+              if (Array.isArray(val)) {
+                return val.slice(0, 500).map((item) => serializeInPage(item, depth + 1, seen));
+              }
+              if (val instanceof Set) {
+                return Array.from(val).slice(0, 500).map((item) => serializeInPage(item, depth + 1, seen));
+              }
+              if (val instanceof Map) {
+                const obj = {};
+                let i = 0;
+                for (const [k, v] of val.entries()) {
+                  if (i++ >= 200) break;
+                  obj[String(k)] = serializeInPage(v, depth + 1, seen);
+                }
+                return obj;
+              }
+              if (val instanceof RegExp || val instanceof Date || val instanceof URL) {
+                return String(val);
+              }
+              if (typeof Element !== "undefined" && val instanceof Element) {
+                const tag = val.tagName.toLowerCase();
+                const item = {
+                  tag,
+                  id: val.id || null,
+                  className: typeof val.className === "string" ? val.className : null,
+                  text: (val.innerText ?? val.textContent ?? "").trim().slice(0, 1000)
+                };
+                if (tag === "a" || val.hasAttribute("href")) {
+                  item.href = val.href || val.getAttribute("href") || null;
+                }
+                if (tag === "img" || tag === "script" || val.hasAttribute("src")) {
+                  item.src = val.src || val.getAttribute("src") || null;
+                }
+                return item;
+              }
+              const obj = {};
+              let count = 0;
+              for (const k of Object.keys(val)) {
+                if (count++ >= 250) break;
+                try {
+                  obj[String(k)] = serializeInPage(val[k], depth + 1, seen);
+                } catch (e) {
+                  obj[String(k)] = `[Unserializable: ${e && e.message ? e.message : String(e)}]`;
+                }
+              }
+              return obj;
+            }
+            return String(val);
+          };
+
+          const rawResult = (0, eval)(snippet);
+          return serializeInPage(rawResult);
+        }
+      });
+      const first = res && res[0] ? res[0] : null;
+      if (first && first.error) {
+        return { ok: false, tabUrl: tab.url || null, error: String(first.error) };
+      }
+      return { ok: true, tabUrl: tab.url || null, data: safeSerialize(first ? first.result : null) };
+    }
+
+    if (method === "getHtml") {
+      const tab = await getTargetTab(msg);
+      if (!tab) return { ok: false, error: "no target tab found" };
+      const res = await browser.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          const html = document.documentElement ? document.documentElement.outerHTML : "";
+          return {
+            url: location.href,
+            title: document.title || "",
+            length: html.length,
+            html: html.length > 500000 ? html.slice(0, 500000) : html,
+            truncated: html.length > 500000
+          };
+        }
+      });
+      const raw = res && res[0] ? res[0].result : null;
+      return { ok: true, tabUrl: tab.url || null, data: safeSerialize(raw) };
     }
 
     if (method === "collect") {
-      const selector = msg.selector || params[0] || null;
+      const selector = msg.selector ?? params[0] ?? null;
       const all = Boolean(msg.all);
-      const attr = msg.attr || null;
-      const includeHtml = msg.includeHtml !== undefined ? Boolean(msg.includeHtml) : true;
-      const includeAssets = msg.includeAssets !== undefined ? Boolean(msg.includeAssets) : true;
-      const tab = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+      const attr = msg.attr ?? null;
+      const includeHtml = msg.includeHtml !== undefined ? Boolean(msg.includeHtml) : false;
+      const includeAssets = msg.includeAssets !== undefined ? Boolean(msg.includeAssets) : false;
+      const includeNetwork = msg.includeNetwork !== undefined ? Boolean(msg.includeNetwork) : false;
+      const tab = await getTargetTab(msg);
+      if (!tab) return { ok: false, error: "no target tab found" };
 
       const res = await browser.scripting.executeScript({
         target: { tabId: tab.id },
         args: [selector, all, attr, includeHtml, includeAssets],
         func: (sel, isAll, attribute, wantHtml, wantAssets) => {
-          const serialize = (el) => {
-            const out = { tag: el.tagName.toLowerCase(), text: el.innerText ?? el.textContent ?? "" };
-            if (wantHtml) out.html = el.outerHTML;
-            if (attribute) out.attr = el.getAttribute(attribute);
+          const serializeEl = (el) => {
+            const tag = el.tagName.toLowerCase();
+            const out = {
+              tag,
+              text: (el.innerText ?? el.textContent ?? "").trim().slice(0, 2000)
+            };
+            if (tag === "a" || el.hasAttribute("href")) {
+              out.href = el.href || el.getAttribute("href") || null;
+            }
+            if (tag === "img" || tag === "script" || el.hasAttribute("src")) {
+              out.src = el.src || el.getAttribute("src") || null;
+            }
+            if (wantHtml) {
+              out.html = el.outerHTML.slice(0, 10000);
+            }
+            if (attribute) {
+              out.attr = el.getAttribute(attribute);
+            }
             return out;
           };
+
           const collectAssets = () => {
-            const scripts = Array.from(document.scripts || []).map(s => ({
-              src: s.src || null, type: s.type || null, inline: s.src ? null : s.textContent
+            const scripts = Array.from(document.scripts || []).slice(0, 100).map((s) => ({
+              src: s.src || null,
+              type: s.type || null,
+              inlineLength: s.src ? 0 : (s.textContent || "").length
             }));
-            const styles = Array.from(document.querySelectorAll('link[rel~="stylesheet"], style')).map(el =>
+            const styles = Array.from(document.querySelectorAll('link[rel~="stylesheet"], style')).slice(0, 100).map((el) =>
               el.tagName.toLowerCase() === "style"
-                ? { kind: "style", href: null, inline: el.textContent }
-                : { kind: "link", href: el.href || el.getAttribute("href"), inline: null }
+                ? { kind: "style", href: null, inlineLength: (el.textContent || "").length }
+                : { kind: "link", href: el.href || el.getAttribute("href") || null, inlineLength: 0 }
             );
             return { scripts, styles };
           };
+
           let targetData = null;
           if (!sel) {
-            targetData = { url: location.href, title: document.title, text: document.body ? document.body.innerText : "" };
-            if (wantHtml) targetData.html = document.documentElement.outerHTML;
+            const bodyText = document.body ? (document.body.innerText || "") : "";
+            targetData = {
+              url: location.href,
+              title: document.title || "",
+              text: bodyText.slice(0, 50000),
+              textTruncated: bodyText.length > 50000
+            };
+            if (wantHtml) {
+              const docHtml = document.documentElement ? document.documentElement.outerHTML : "";
+              targetData.html = docHtml.slice(0, 200000);
+              targetData.htmlTruncated = docHtml.length > 200000;
+            }
           } else if (isAll) {
-            targetData = Array.from(document.querySelectorAll(sel)).map(serialize);
+            targetData = Array.from(document.querySelectorAll(sel))
+              .slice(0, 500)
+              .map(serializeEl);
           } else {
             const el = document.querySelector(sel);
-            targetData = el ? serialize(el) : null;
+            targetData = el ? serializeEl(el) : null;
           }
+
           return wantAssets ? { target: targetData, assets: collectAssets() } : targetData;
         }
       });
 
-      const entries = Array.from(networkLog.values());
-      return {
+      const response = {
         ok: true,
-        tabUrl: tab ? tab.url : null,
-        data: res && res[0] ? (res[0].result ?? null) : null,
-        network: {
-          requests: entries,
-          js: entries.filter(e => e.type === "script"),
-          css: entries.filter(e => e.type === "stylesheet")
-        }
+        tabUrl: tab.url || null,
+        data: safeSerialize(res && res[0] ? res[0].result : null)
       };
+
+      if (includeNetwork) {
+        const entries = Array.from(networkLog.values()).slice(-100).map((e) => ({
+          requestId: e.requestId,
+          url: e.url,
+          method: e.method,
+          type: e.type,
+          tabId: e.tabId,
+          statusCode: e.statusCode ?? null,
+          statusLine: e.statusLine ?? null,
+          rawBytes: e.rawBytes ?? null
+        }));
+        response.network = {
+          requests: entries,
+          js: entries.filter((e) => e.type === "script"),
+          css: entries.filter((e) => e.type === "stylesheet")
+        };
+      }
+
+      return safeSerialize(response);
     }
 
     if (method === "getCookies") {
       const details = msg.details || (msg.url ? { url: msg.url } : {});
-      return { ok: true, data: await browser.cookies.getAll(details) };
+      return { ok: true, data: safeSerialize(await browser.cookies.getAll(details)) };
     }
 
     if (method === "setCookie") {
       const details = msg.cookie || msg;
-      return { ok: true, data: await browser.cookies.set(details) };
+      return { ok: true, data: safeSerialize(await browser.cookies.set(details)) };
     }
 
     if (method === "storageGet") {
       const area = msg.area === "sync" ? browser.storage.sync : browser.storage.local;
-      return { ok: true, data: await area.get(msg.keys ?? null) };
+      return { ok: true, data: safeSerialize(await area.get(msg.keys ?? null)) };
     }
 
     if (method === "storageSet") {
@@ -289,19 +543,35 @@ async function handleCommand(msg) {
     }
 
     if (method === "searchHistory") {
-      return { ok: true, data: await browser.history.search({ text: msg.text || "", maxResults: Number(msg.maxResults || 50) }) };
+      return {
+        ok: true,
+        data: safeSerialize(await browser.history.search({
+          text: msg.text || "",
+          maxResults: Number(msg.maxResults || 50)
+        }))
+      };
     }
 
     if (method === "getBookmarks") {
-      return { ok: true, data: msg.query ? await browser.bookmarks.search(msg.query) : await browser.bookmarks.getTree() };
+      return {
+        ok: true,
+        data: safeSerialize(msg.query ? await browser.bookmarks.search(msg.query) : await browser.bookmarks.getTree())
+      };
     }
 
     if (method === "createBookmark") {
-      return { ok: true, data: await browser.bookmarks.create({ title: msg.title || msg.url, url: msg.url, parentId: msg.parentId }) };
+      return {
+        ok: true,
+        data: safeSerialize(await browser.bookmarks.create({
+          title: msg.title || msg.url,
+          url: msg.url,
+          parentId: msg.parentId
+        }))
+      };
     }
 
     if (method === "getNavLog") {
-      return { ok: true, data: navLog.slice(-Number(msg.limit || 100)) };
+      return { ok: true, data: safeSerialize(navLog.slice(-Number(msg.limit || 100))) };
     }
 
     if (method === "registerUserScript") {
@@ -321,7 +591,7 @@ async function handleCommand(msg) {
     }
 
     if (method === "getDynamicRules") {
-      return { ok: true, data: await browser.declarativeNetRequest.getDynamicRules() };
+      return { ok: true, data: safeSerialize(await browser.declarativeNetRequest.getDynamicRules()) };
     }
 
     if (method === "updateDynamicRules") {
@@ -347,7 +617,7 @@ async function handleCommand(msg) {
     }
 
     if (method === "readClipboard") {
-      return { ok: true, text: await navigator.clipboard.readText() };
+      return { ok: true, text: safeSerialize(await navigator.clipboard.readText()) };
     }
 
     if (method === "writeClipboard") {
@@ -365,15 +635,15 @@ async function handleCommand(msg) {
     }
 
     if (method === "getProxy") {
-      return { ok: true, data: await browser.proxy.settings.get({}) };
+      return { ok: true, data: safeSerialize(await browser.proxy.settings.get({})) };
     }
 
     if (method === "setProxy") {
-      return { ok: true, data: await browser.proxy.settings.set({ value: msg.value || {} }) };
+      return { ok: true, data: safeSerialize(await browser.proxy.settings.set({ value: msg.value || {} })) };
     }
 
     if (method === "getExtensions") {
-      return { ok: true, data: await browser.management.getAll() };
+      return { ok: true, data: safeSerialize(await browser.management.getAll()) };
     }
 
     if (method === "setExtensionEnabled") {
@@ -383,7 +653,10 @@ async function handleCommand(msg) {
 
     return { ok: false, error: "unknown method" };
   } catch (err) {
-    return { ok: false, error: err && err.message ? err.message : String(err) };
+    return {
+      ok: false,
+      error: err && err.message ? err.message : String(err)
+    };
   }
 }
 
